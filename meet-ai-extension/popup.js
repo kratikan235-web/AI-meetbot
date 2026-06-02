@@ -4,25 +4,12 @@ const MIN_BLOB_BYTES = 8000;
 const MIN_BYTES_PER_SECOND = 800;
 
 const statusEl = document.getElementById("status");
-let mediaRecorder = null;
-let audioChunks = [];
-let streamsToStop = [];
-let audioContext = null;
 let recordingStartedAt = 0;
 let recordMode = "none";
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.style.color = isError ? "#b00020" : "#1b5e20";
-}
-
-function stopAllStreams() {
-  streamsToStop.forEach((stream) => stream.getTracks().forEach((t) => t.stop()));
-  streamsToStop = [];
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
 }
 
 function mapMicError(err) {
@@ -42,9 +29,81 @@ function mapMicError(err) {
   return err?.message || String(err);
 }
 
-async function requestMicrophone() {
-  return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+function callBackground(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ target: "background", ...message }, (resp) => {
+      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+      else resolve(resp || { ok: false, error: "No response from background" });
+    });
+  });
 }
+
+async function ensureOffscreenDocument() {
+  // If an offscreen document already exists, do not try to create another.
+  try {
+    if (chrome.runtime.getContexts) {
+      const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });
+      if (Array.isArray(contexts) && contexts.length > 0) return;
+    }
+  } catch {
+    // getContexts not available / failed; fall back to createDocument try/catch.
+  }
+
+  try {
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["USER_MEDIA", "AUDIO_PLAYBACK"],
+      justification: "Record Meet audio in background and keep audio audible.",
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const m = msg.toLowerCase();
+    // Chrome errors vary by version.
+    if (
+      m.includes("only a single offscreen document") ||
+      m.includes("only one offscreen document") ||
+      m.includes("single offscreen document")
+    ) {
+      return;
+    }
+    throw e;
+  }
+}
+
+function callOffscreen(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ target: "offscreen", ...message }, (resp) => {
+      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+      else resolve(resp || { ok: false, error: "No response from offscreen" });
+    });
+  });
+}
+
+async function refreshStatus() {
+  try {
+    await ensureOffscreenDocument();
+    const st = await callOffscreen({ action: "GET_STATUS" });
+    if (st?.ok && st.recording) {
+      recordMode = st.mode || "recording";
+      setStatus(`Recording… (${recordMode})`);
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+async function releaseIfCaptureActive() {
+  await ensureOffscreenDocument();
+  const st = await callOffscreen({ action: "GET_STATUS" });
+  if (st?.ok && st.captureActive && !st.recording) {
+    await callOffscreen({ action: "RELEASE" });
+  }
+}
+
+// When popup opens, show current recording state (popup can close during Meet interactions).
+refreshStatus();
 
 document.getElementById("start").addEventListener("click", () => {
   chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
@@ -61,77 +120,47 @@ document.getElementById("start").addEventListener("click", () => {
     setStatus("Starting…");
 
     try {
-      stopAllStreams();
-      if (mediaRecorder?.state === "recording") mediaRecorder.stop();
-      mediaRecorder = null;
-      audioChunks = [];
+      // If recording already running, don't try to capture again.
+      const already = await refreshStatus();
+      if (already) return;
+
+      // If a previous capture is still alive (even without recording), release it.
+      // Otherwise Chrome throws: "Cannot capture a tab with an active stream."
+      await releaseIfCaptureActive();
+
       recordingStartedAt = Date.now();
+      recordMode = "starting";
 
-      const micStream = await requestMicrophone();
-      streamsToStop.push(micStream);
-
-      let recordStream = micStream;
-      recordMode = "mic";
-
-      try {
-        const streamId = await new Promise((resolve, reject) => {
-          chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => {
-            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-            else if (!id) reject(new Error("No tab audio"));
-            else resolve(id);
-          });
+      // Acquire the tab stream id in the popup (user gesture + active tab).
+      const streamId = await new Promise((resolve, reject) => {
+        chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else if (!id) reject(new Error("No tab audio stream id"));
+          else resolve(id);
         });
-
-        const tabStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            mandatory: {
-              chromeMediaSource: "tab",
-              chromeMediaSourceId: streamId,
-            },
-          },
-          video: false,
-        });
-        streamsToStop.push(tabStream);
-
-        audioContext = new AudioContext();
-        await audioContext.resume();
-        const destination = audioContext.createMediaStreamDestination();
-        audioContext.createMediaStreamSource(micStream).connect(destination);
-        audioContext.createMediaStreamSource(tabStream).connect(destination);
-        recordStream = destination.stream;
-        recordMode = "mic+tab";
-      } catch {
-        // mic only is fine
-      }
-
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-
-      mediaRecorder = new MediaRecorder(recordStream, {
-        mimeType,
-        audioBitsPerSecond: 128000,
       });
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data?.size > 0) audioChunks.push(event.data);
-      };
+      await ensureOffscreenDocument();
+      // Prefer direct offscreen messaging (avoids SW wake/race issues).
+      let res = await callOffscreen({ action: "START_RECORDING", streamId });
+      if (!res?.ok) {
+        res = await callBackground({ action: "START_RECORDING", streamId });
+      }
+      if (!res?.ok) {
+        setStatus(res?.error || "Failed to start recording.", true);
+        return;
+      }
 
-      mediaRecorder.start(500);
-      setStatus("Recording…");
+      recordMode = res.mode || "recording";
+      if (res.alreadyRecording) setStatus(`Already recording… (${recordMode})`);
+      else setStatus(`Recording… (${recordMode})`);
     } catch (err) {
-      stopAllStreams();
       setStatus(mapMicError(err), true);
     }
   });
 });
 
 document.getElementById("stop").addEventListener("click", () => {
-  if (!mediaRecorder || mediaRecorder.state === "inactive") {
-    setStatus("Not recording. Click Start first.", true);
-    return;
-  }
-
   const elapsed = Date.now() - recordingStartedAt;
   if (elapsed < MIN_RECORD_MS) {
     setStatus(`Wait ${Math.ceil((MIN_RECORD_MS - elapsed) / 1000)}s more.`, true);
@@ -140,41 +169,16 @@ document.getElementById("stop").addEventListener("click", () => {
 
   setStatus("Uploading…");
 
-  mediaRecorder.onstop = async () => {
-    const blob = new Blob(audioChunks, { type: "audio/webm" });
-    const durationSec = elapsed / 1000;
-    const bps = blob.size / durationSec;
-    audioChunks = [];
-    mediaRecorder = null;
-    stopAllStreams();
-
-    if (blob.size < MIN_BLOB_BYTES || bps < MIN_BYTES_PER_SECOND) {
-      setStatus("Recording too quiet. Check microphone and try again.", true);
-      return;
-    }
-
-    try {
-      const formData = new FormData();
-      formData.append("file", blob, `meeting_${Date.now()}.webm`);
-      const res = await fetch(BACKEND_URL, { method: "POST", body: formData });
-      const text = await res.text();
-      if (!res.ok) {
-        let detail = text;
-        try {
-          detail = JSON.parse(text).detail || text;
-        } catch {
-          // keep text
-        }
-        setStatus(String(detail), true);
+  ensureOffscreenDocument()
+    .then(() => callOffscreen({ action: "STOP_RECORDING" }))
+    .then((res) => (res?.ok ? res : callBackground({ action: "STOP_RECORDING" })))
+    .then((res) => {
+      if (!res?.ok) {
+        setStatus(res?.error || "Failed to stop recording.", true);
         return;
       }
-      const data = JSON.parse(text);
-      setStatus(`Done. MOM saved: ${data.file_saved || "mom_reports/"}`);
-    } catch (err) {
-      setStatus(err.message, true);
-    }
-  };
-
-  mediaRecorder.requestData();
-  mediaRecorder.stop();
+      const saved = res?.data?.file_saved || "mom_reports/";
+      setStatus(`Done. MOM saved: ${saved}`);
+    })
+    .catch((err) => setStatus(String(err), true));
 });
