@@ -96,6 +96,7 @@ pydub==0.25.1
 Pygments==2.20.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
+python-multipart==0.0.29
 pytorch-lightning==2.6.5
 pytorch-metric-learning==2.9.0
 PyYAML==6.0.3

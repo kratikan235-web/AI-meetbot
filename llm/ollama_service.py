@@ -1,52 +1,68 @@
-import requests
+import re
 
-def generate_mom(transcript):
-    print("Generating MOM...")
 
-    prompt = f"""
-    You are an AI assistant for daily scrum meetings.
+def generate_mom(transcript: str) -> str:
+    """Build MOM from transcript only (no LLM — reliable with small models)."""
+    sentences = _split_sentences(transcript)
+    if not sentences:
+        sentences = [transcript.strip()]
 
-    Convert the transcript into a structured MOM in this format:
+    sentences = [s for s in sentences if not _is_noise(s)]
+    if not sentences:
+        sentences = [transcript.strip()]
 
-    MOM (Daily Scrum)
+    topic = sentences[0]
+    if len(topic) > 120:
+        topic = topic[:117] + "..."
 
-    Topic:
-    - Main topic discussed
+    discussion = "\n".join(f"- {s}" for s in sentences)
+    lower = transcript.lower()
 
-    Discussion:
-    - What was discussed in detail (bullet points)
-
-    Progress:
-    - What work has been done
-
-    Blockers:
-    - Any issues/blockers (if none, write "None")
-
-    Action Items:
-    - Tasks to be done next
-
-    Next Steps:
-    - What should happen next
-
-    Keep it concise and clear.
-
-    Transcript:
-    {transcript}
-    """
-
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "tinyllama",
-            "prompt": prompt,
-            "stream": False
-        }
+    progress = _bullets_matching(
+        sentences,
+        r"done|finished|completed|built|fixed|working|converted|extension|api|record|learning|used|walk",
+    )
+    blockers = _bullets_matching(sentences, r"block|issue|problem|stuck|error")
+    actions = _bullets_matching(
+        sentences,
+        r"need to|should|will|next|create|generate|fix|try|start",
     )
 
-    data = response.json()
+    return f"""## Topic
+{topic}
 
-    if "response" not in data:
-        print("OLLAMA ERROR:", data)
-        return "MOM generation failed."
+## Discussion
+{discussion}
 
-    return data["response"]
+## Progress
+{progress or "- Not mentioned"}
+
+## Blockers
+{blockers or "- None mentioned"}
+
+## Action Items
+{actions or "- Not mentioned"}
+
+## Next Steps
+{actions or "- Not mentioned"}
+"""
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return parts
+
+
+def _is_noise(sentence: str) -> bool:
+    lower = sentence.lower()
+    noise = (
+        "subscribe to my channel",
+        "press the bell icon",
+        "don't miss any of my videos",
+    )
+    return any(n in lower for n in noise)
+
+
+def _bullets_matching(sentences: list[str], pattern: str) -> str:
+    matched = [f"- {s}" for s in sentences if re.search(pattern, s, re.I)]
+    return "\n".join(matched)

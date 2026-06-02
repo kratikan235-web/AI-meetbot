@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Meet AI Notes",
+  "version": "2.3",
+  "description": "Capture Google Meet tab audio and generate meeting minutes.",
+  "permissions": ["activeTab", "tabCapture", "offscreen", "tabs", "storage"],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Meet AI Notes"
+  }
+}
