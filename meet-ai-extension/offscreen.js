@@ -4,6 +4,7 @@ let recordStream = null;
 let tabStream = null;
 let micStream = null;
 let audioContext = null;
+let monitorGain = null;
 let recordingStartedAt = 0;
 let recordingMode = "none";
 
@@ -17,6 +18,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.action === "PING") {
     sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.action === "GET_STATUS") {
+    const hasLiveTracks = (s) => Boolean(s && s.getTracks().some((t) => t.readyState === "live"));
+    sendResponse({
+      ok: true,
+      recording: Boolean(mediaRecorder && mediaRecorder.state === "recording"),
+      captureActive: hasLiveTracks(recordStream) || hasLiveTracks(tabStream) || hasLiveTracks(micStream),
+      mode: recordingMode,
+      startedAt: recordingStartedAt,
+    });
     return false;
   }
 
@@ -69,6 +82,7 @@ function releaseCapture() {
         audioContext.close().catch(() => {});
         audioContext = null;
       }
+      monitorGain = null;
       console.log("[offscreen] capture released");
       resolve();
     };
@@ -129,9 +143,6 @@ async function buildRecordStream(streamId) {
   if (!micTrack || micTrack.readyState !== "live") {
     throw new Error("Microphone not available. Allow microphone in Chrome and try again.");
   }
-  if (micTrack.muted) {
-    throw new Error("Microphone is muted. Unmute your mic in Meet and system settings.");
-  }
 
   recordingMode = "mic";
   let stream = micStream;
@@ -154,6 +165,13 @@ async function buildRecordStream(streamId) {
     audioContext.createMediaStreamSource(tabStream).connect(destination);
     audioContext.createMediaStreamSource(micStream).connect(destination);
 
+    // Ensure the user can still hear the meeting while we capture tab audio.
+    // Some capture paths effectively "steal" audio output from the tab.
+    // We intentionally do NOT route microphone to speakers to avoid feedback.
+    monitorGain = audioContext.createGain();
+    monitorGain.gain.value = 1.0;
+    audioContext.createMediaStreamSource(tabStream).connect(monitorGain).connect(audioContext.destination);
+
     const mixed = destination.stream;
     const mixLive = await streamHasAudio(mixed, 400);
     if (mixLive) {
@@ -166,6 +184,7 @@ async function buildRecordStream(streamId) {
       tabStream = null;
       await audioContext.close();
       audioContext = null;
+      monitorGain = null;
     }
   } catch (err) {
     console.warn("[offscreen] tab capture skipped:", err);
@@ -178,7 +197,9 @@ async function buildRecordStream(streamId) {
 
 async function startRecording(streamId) {
   if (!streamId) throw new Error("Missing stream id");
-  if (mediaRecorder?.state === "recording") throw new Error("Already recording");
+  if (mediaRecorder?.state === "recording") {
+    return { mode: recordingMode, alreadyRecording: true };
+  }
 
   await releaseCapture();
 
@@ -207,6 +228,14 @@ async function startRecording(streamId) {
   console.log("[offscreen] MediaRecorder started, mode:", recordingMode);
   return { mode: recordingMode };
 }
+
+// Keep audio contexts alive even if the document becomes hidden.
+document.addEventListener("visibilitychange", () => {
+  if (!audioContext) return;
+  if (audioContext.state === "suspended") {
+    audioContext.resume().catch(() => {});
+  }
+});
 
 function stopRecording() {
   return new Promise((resolve) => {
