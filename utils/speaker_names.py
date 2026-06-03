@@ -237,14 +237,19 @@ def build_speaker_timeline(
     timeline = compress_speaker_timeline(transitions or pool, duration_sec)
 
     if len(roster_set) >= 2 and len({e["name"] for e in timeline}) < 2:
-        names = [n for n in filter_person_names(roster) if n in roster_set][:2]
-        if len(names) < 2:
-            names = sorted(roster_set)[:2]
+        names = [n for n in filter_person_names(roster) if n in roster_set]
         duration_ms = max(int(duration_sec * 1000), 1000)
-        timeline = [
-            {"t": 0, "name": names[0], "source": "roster_alternate"},
-            {"t": duration_ms // 2, "name": names[1], "source": "roster_alternate"},
-        ]
+        if len(names) == 2:
+            timeline = [
+                {"t": 0, "name": names[0], "source": "roster_alternate"},
+                {"t": duration_ms // 2, "name": names[1], "source": "roster_alternate"},
+            ]
+        elif len(names) >= 3:
+            step = duration_ms // len(names)
+            timeline = [
+                {"t": i * step, "name": names[i], "source": "roster_alternate_3p"}
+                for i in range(len(names))
+            ]
 
     return timeline
 

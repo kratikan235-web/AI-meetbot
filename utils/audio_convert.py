@@ -20,7 +20,6 @@ def to_whisper_wav(source_path: str) -> str:
     if audio.dBFS < -35:
         gain_db = min(25, -18 - audio.dBFS)
         audio = audio.apply_gain(gain_db)
-        print(f"Applied gain +{gain_db:.1f} dB (now {audio.dBFS:.1f} dBFS)")
 
     wav_path = f"{os.path.splitext(source_path)[0]}.wav"
     audio.export(wav_path, format="wav")

@@ -49,18 +49,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "GET_SPEAKER_DATA") {
     finalizeSpeakerData();
     ensureMinimumSpeakerPayload();
+    const rosterNames = rosterParticipants
+      .map((p) => p.name)
+      .filter((n) => isHumanParticipantName(n));
+    const participantSet = new Set(rosterNames);
+    if (selfName && isHumanParticipantName(selfName)) {
+      participantSet.add(selfName);
+    }
     const payload = {
       ok: true,
       build: BUILD,
       speaker_events: collectedSpeakerEvents.slice(-2000),
-      participants: rosterParticipants.map((p) => p.name).filter((n) => isHumanParticipantName(n)),
-      participant_debug: rosterParticipants,
+      participants: [...participantSet],
       self_name: selfName,
       solo: isSoloMeeting(),
     };
-    console.log("[meet-ai] GET_SPEAKER_DATA participants:", JSON.stringify(payload.participants));
-    console.log("[meet-ai] GET_SPEAKER_DATA speaker_events:", JSON.stringify(payload.speaker_events));
-    console.log("[meet-ai] GET_SPEAKER_DATA self_name:", payload.self_name || "(none)");
     sendResponse(payload);
     return false;
   }
@@ -76,9 +79,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-function debugLog(kind, message, detail) {
-  console.log(`[meet-ai][${kind}] ${message}${detail ? `: ${detail}` : ""}`);
-}
+function debugLog() {}
 
 function relMs() {
   return Math.max(0, Date.now() - (recordingStartMs || Date.now()));
@@ -260,21 +261,6 @@ function findSelfNameFromAccount() {
     if (m && isHumanParticipantName(m[1])) {
       debugLog("self", "aria-label (you)", m[1].trim());
       return m[1].trim();
-    }
-  }
-  return null;
-}
-
-function findPeoplePanelRoot() {
-  for (const sel of [
-    '[aria-label="Participants"]',
-    '[aria-label*="People in the call"]',
-    '[data-panel-id="people"]',
-  ]) {
-    const el = document.querySelector(sel);
-    if (el?.querySelector("[data-participant-id]")) {
-      debugLog("roster", "panel", sel);
-      return el;
     }
   }
   return null;

@@ -91,7 +91,6 @@ function releaseCapture() {
         audioContext = null;
       }
       monitorGain = null;
-      console.log("[offscreen] capture released");
       resolve();
     };
 
@@ -126,7 +125,6 @@ async function streamHasAudio(stream, sampleMs = 500) {
       for (const v of bins) peak = Math.max(peak, v);
       await new Promise((r) => setTimeout(r, 50));
     }
-    console.log("[offscreen] audio peak level:", peak);
     return peak > 8;
   } finally {
     await ctx.close();
@@ -185,7 +183,6 @@ async function buildRecordStream(streamId) {
     if (mixLive) {
       stream = mixed;
       recordingMode = "mic+tab";
-      console.log("[offscreen] recording mic + Meet tab");
     } else {
       console.warn("[offscreen] tab mix silent — using microphone only");
       stopAllTracks(tabStream);
@@ -240,7 +237,6 @@ async function notifyMeetRecordingStarted(tabId, startedAtMs) {
     action: "RECORDING_STARTED",
     startedAtMs,
   });
-  console.log("[offscreen] RECORDING_STARTED → tab", tabId, res);
   return Boolean(res?.ok);
 }
 
@@ -282,10 +278,6 @@ async function fetchSpeakerDataFromMeetTab(preferredTabId, startedAtMs) {
     return empty;
   }
 
-  console.log("[offscreen] participants:", JSON.stringify(data.participants || []));
-  console.log("[offscreen] speaker_events:", JSON.stringify(data.speaker_events || []));
-  console.log("[offscreen] self_name:", data.self_name || "(none)");
-
   return {
     speaker_events: data.speaker_events || [],
     participants: data.participants || [],
@@ -320,12 +312,10 @@ async function startRecording(streamId, tabId) {
   mediaRecorder.ondataavailable = (event) => {
     if (event.data?.size > 0) {
       audioChunks.push(event.data);
-      console.log("[offscreen] chunk bytes:", event.data.size);
     }
   };
 
   mediaRecorder.start(500);
-  console.log("[offscreen] MediaRecorder started, mode:", recordingMode, "meetTabId:", meetTabId);
   await notifyMeetRecordingStarted(meetTabId, recordingStartedAt);
   return { mode: recordingMode };
 }
@@ -391,14 +381,10 @@ function stopRecording(prefetched = null) {
         }
       }
 
-      console.log("[offscreen] speaker_events uploaded:", JSON.stringify(speakerMeta.speaker_events));
-      console.log("[offscreen] participants uploaded:", JSON.stringify(speakerMeta.participants));
-
       recordingStartedAt = 0;
       meetTabId = null;
 
       const bps = blob.size / durationSec;
-      console.log(`[offscreen] blob ${blob.size} bytes, ${durationSec.toFixed(1)}s, ${bps.toFixed(0)} B/s, mode=${recordingMode}`);
 
       await releaseCapture();
 
@@ -443,12 +429,6 @@ async function uploadBlob(blob, extra = null) {
   if (extra?.self_name) {
     formData.append("self_name", String(extra.self_name));
   }
-
-  console.log(
-    `[offscreen] POST /upload participants=${parts.length} events=${events.length} startedAt=${startedAt} self_name=${extra?.self_name || "(none)"}`,
-  );
-  console.log("[offscreen] upload speaker_events:", JSON.stringify(events));
-  console.log("[offscreen] upload participants:", JSON.stringify(parts));
 
   const res = await fetch(BACKEND_URL, { method: "POST", body: formData });
   if (!res.ok) {

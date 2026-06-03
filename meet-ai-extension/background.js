@@ -1,5 +1,3 @@
-console.log("[background] Meet AI Notes loaded");
-
 async function ensureOffscreenDocument() {
   // If an offscreen document already exists, do not try to create another.
   try {
@@ -88,6 +86,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  console.log("[background] extension installed/updated");
-});
+chrome.runtime.onInstalled.addListener(() => {});

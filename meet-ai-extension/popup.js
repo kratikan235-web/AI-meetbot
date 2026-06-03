@@ -110,10 +110,6 @@ async function fetchSpeakerDataFromMeetTab(tabId) {
 
   if (!data?.ok) return null;
 
-  console.log("[popup] participants collected:", JSON.stringify(data.participants || []));
-  console.log("[popup] speaker_events collected:", JSON.stringify(data.speaker_events || []));
-  console.log("[popup] self_name:", data.self_name || "(none)");
-
   return data;
 }
 
