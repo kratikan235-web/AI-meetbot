@@ -1,5 +1,3 @@
-console.log("[background] Meet AI Notes loaded");
-
 async function ensureOffscreenDocument() {
   // If an offscreen document already exists, do not try to create another.
   try {
@@ -55,12 +53,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.action === "START_RECORDING") {
       await ensureOffscreenDocument();
-      const res = await callOffscreen({ action: "START_RECORDING", streamId: msg.streamId });
+      const res = await callOffscreen({
+        action: "START_RECORDING",
+        streamId: msg.streamId,
+        meetTabId: msg.meetTabId,
+      });
       return res;
     }
 
     if (msg.action === "STOP_RECORDING") {
-      const res = await callOffscreen({ action: "STOP_RECORDING" });
+      const res = await callOffscreen({
+        action: "STOP_RECORDING",
+        speaker_events: msg.speaker_events,
+        participants: msg.participants,
+        self_name: msg.self_name,
+        recording_started_at_ms: msg.recording_started_at_ms,
+        meetTabId: msg.meetTabId,
+      });
       return res;
     }
 
@@ -77,6 +86,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  console.log("[background] extension installed/updated");
-});
+chrome.runtime.onInstalled.addListener(() => {});

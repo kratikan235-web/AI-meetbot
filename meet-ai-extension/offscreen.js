@@ -7,6 +7,7 @@ let audioContext = null;
 let monitorGain = null;
 let recordingStartedAt = 0;
 let recordingMode = "none";
+let meetTabId = null;
 
 const BACKEND_URL = "http://127.0.0.1:8000/upload";
 const MIN_BLOB_BYTES = 5_000;
@@ -41,14 +42,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.action === "START_RECORDING") {
-    startRecording(msg.streamId)
+    startRecording(msg.streamId, msg.meetTabId)
       .then((info) => sendResponse({ ok: true, ...info }))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
   }
 
   if (msg.action === "STOP_RECORDING") {
-    stopRecording()
+    stopRecording({
+      speaker_events: msg.speaker_events,
+      participants: msg.participants,
+      self_name: msg.self_name,
+      recording_started_at_ms: msg.recording_started_at_ms,
+      meetTabId: msg.meetTabId,
+    })
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
@@ -77,13 +84,13 @@ function releaseCapture() {
       audioChunks = [];
       recordingStartedAt = 0;
       recordingMode = "none";
+      meetTabId = null;
 
       if (audioContext) {
         audioContext.close().catch(() => {});
         audioContext = null;
       }
       monitorGain = null;
-      console.log("[offscreen] capture released");
       resolve();
     };
 
@@ -118,7 +125,6 @@ async function streamHasAudio(stream, sampleMs = 500) {
       for (const v of bins) peak = Math.max(peak, v);
       await new Promise((r) => setTimeout(r, 50));
     }
-    console.log("[offscreen] audio peak level:", peak);
     return peak > 8;
   } finally {
     await ctx.close();
@@ -177,7 +183,6 @@ async function buildRecordStream(streamId) {
     if (mixLive) {
       stream = mixed;
       recordingMode = "mic+tab";
-      console.log("[offscreen] recording mic + Meet tab");
     } else {
       console.warn("[offscreen] tab mix silent — using microphone only");
       stopAllTracks(tabStream);
@@ -195,7 +200,93 @@ async function buildRecordStream(streamId) {
   return stream;
 }
 
-async function startRecording(streamId) {
+function sendContentMessage(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { target: "content", ...message }, (resp) => {
+      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+      else resolve(resp || { ok: false, error: "No response from content script" });
+    });
+  });
+}
+
+async function ensureContentScriptOnTab(tabId) {
+  const ping = await sendContentMessage(tabId, { action: "PING" });
+  if (ping?.ok) return true;
+  if (!chrome.scripting?.executeScript) return false;
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch {
+    return false;
+  }
+  const ping2 = await sendContentMessage(tabId, { action: "PING" });
+  return Boolean(ping2?.ok);
+}
+
+/** Tell Meet tab to track speakers (must run after MediaRecorder.start). */
+async function notifyMeetRecordingStarted(tabId, startedAtMs) {
+  if (!tabId) {
+    console.warn("[offscreen] notifyMeetRecordingStarted: no meetTabId");
+    return false;
+  }
+  const ready = await ensureContentScriptOnTab(tabId);
+  if (!ready) {
+    console.warn("[offscreen] content script not ready on tab", tabId);
+    return false;
+  }
+  const res = await sendContentMessage(tabId, {
+    action: "RECORDING_STARTED",
+    startedAtMs,
+  });
+  return Boolean(res?.ok);
+}
+
+async function fetchSpeakerDataFromMeetTab(preferredTabId, startedAtMs) {
+  const empty = { speaker_events: [], participants: [], self_name: null, recording_started_at_ms: startedAtMs };
+  if (!chrome.tabs?.query) return empty;
+
+  let tabId = preferredTabId || meetTabId;
+  let tab = null;
+
+  if (tabId) {
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      tabId = null;
+    }
+  }
+
+  if (!tabId || !tab?.url?.includes("meet.google.com")) {
+    try {
+      const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+      tab = tabs[0] || null;
+      tabId = tab?.id || null;
+    } catch {
+      return empty;
+    }
+  }
+
+  if (!tabId) return empty;
+
+  const ready = await ensureContentScriptOnTab(tabId);
+  if (!ready) return empty;
+
+  const data = await sendContentMessage(tabId, { action: "GET_SPEAKER_DATA" });
+  await sendContentMessage(tabId, { action: "CLEAR_SPEAKER_DATA" });
+
+  if (!data?.ok) {
+    console.warn("[offscreen] GET_SPEAKER_DATA failed on tab", tabId, data);
+    return empty;
+  }
+
+  return {
+    speaker_events: data.speaker_events || [],
+    participants: data.participants || [],
+    self_name: data.self_name || null,
+    recording_started_at_ms: startedAtMs,
+  };
+}
+
+async function startRecording(streamId, tabId) {
   if (!streamId) throw new Error("Missing stream id");
   if (mediaRecorder?.state === "recording") {
     return { mode: recordingMode, alreadyRecording: true };
@@ -204,6 +295,7 @@ async function startRecording(streamId) {
   await releaseCapture();
 
   audioChunks = [];
+  meetTabId = typeof tabId === "number" ? tabId : null;
   recordingStartedAt = Date.now();
 
   recordStream = await buildRecordStream(streamId);
@@ -220,12 +312,11 @@ async function startRecording(streamId) {
   mediaRecorder.ondataavailable = (event) => {
     if (event.data?.size > 0) {
       audioChunks.push(event.data);
-      console.log("[offscreen] chunk bytes:", event.data.size);
     }
   };
 
   mediaRecorder.start(500);
-  console.log("[offscreen] MediaRecorder started, mode:", recordingMode);
+  await notifyMeetRecordingStarted(meetTabId, recordingStartedAt);
   return { mode: recordingMode };
 }
 
@@ -237,7 +328,15 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-function stopRecording() {
+function hasSpeakerPayload(meta) {
+  return Boolean(
+    meta?.self_name ||
+      (Array.isArray(meta?.speaker_events) && meta.speaker_events.length) ||
+      (Array.isArray(meta?.participants) && meta.participants.length),
+  );
+}
+
+function stopRecording(prefetched = null) {
   return new Promise((resolve) => {
     if (!mediaRecorder || mediaRecorder.state === "inactive") {
       resolve({ ok: false, error: "Not recording. Click Start first." });
@@ -256,11 +355,36 @@ function stopRecording() {
     mediaRecorder.onstop = async () => {
       const blob = new Blob(audioChunks, { type: "audio/webm" });
       const durationSec = elapsed / 1000;
+      const startedAtMs = recordingStartedAt;
+      const tabForSpeaker = meetTabId;
       audioChunks = [];
+
+      let speakerMeta = {
+        speaker_events: Array.isArray(prefetched?.speaker_events) ? prefetched.speaker_events : [],
+        participants: Array.isArray(prefetched?.participants) ? prefetched.participants : [],
+        self_name: prefetched?.self_name || null,
+        recording_started_at_ms:
+          typeof prefetched?.recording_started_at_ms === "number" && prefetched.recording_started_at_ms > 0
+            ? prefetched.recording_started_at_ms
+            : startedAtMs,
+      };
+
+      if (!hasSpeakerPayload(speakerMeta)) {
+        try {
+          const fromTab = await fetchSpeakerDataFromMeetTab(
+            prefetched?.meetTabId || tabForSpeaker,
+            startedAtMs,
+          );
+          if (hasSpeakerPayload(fromTab)) speakerMeta = fromTab;
+        } catch (err) {
+          console.warn("[offscreen] speaker fetch fallback failed:", err);
+        }
+      }
+
       recordingStartedAt = 0;
+      meetTabId = null;
 
       const bps = blob.size / durationSec;
-      console.log(`[offscreen] blob ${blob.size} bytes, ${durationSec.toFixed(1)}s, ${bps.toFixed(0)} B/s, mode=${recordingMode}`);
 
       await releaseCapture();
 
@@ -281,7 +405,7 @@ function stopRecording() {
       }
 
       try {
-        const data = await uploadBlob(blob);
+        const data = await uploadBlob(blob, speakerMeta);
         resolve({ ok: true, data, mode: recordingMode });
       } catch (err) {
         resolve({ ok: false, error: String(err) });
@@ -293,9 +417,18 @@ function stopRecording() {
   });
 }
 
-async function uploadBlob(blob) {
+async function uploadBlob(blob, extra = null) {
   const formData = new FormData();
   formData.append("file", blob, `meeting_${Date.now()}.webm`);
+  const events = extra?.speaker_events ?? [];
+  const parts = extra?.participants ?? [];
+  const startedAt = extra?.recording_started_at_ms ?? 0;
+  formData.append("speaker_events", JSON.stringify(events));
+  formData.append("participants", JSON.stringify(parts));
+  formData.append("recording_started_at_ms", String(startedAt));
+  if (extra?.self_name) {
+    formData.append("self_name", String(extra.self_name));
+  }
 
   const res = await fetch(BACKEND_URL, { method: "POST", body: formData });
   if (!res.ok) {
