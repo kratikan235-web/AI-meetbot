@@ -55,12 +55,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.action === "START_RECORDING") {
       await ensureOffscreenDocument();
-      const res = await callOffscreen({ action: "START_RECORDING", streamId: msg.streamId });
+      const res = await callOffscreen({
+        action: "START_RECORDING",
+        streamId: msg.streamId,
+        meetTabId: msg.meetTabId,
+      });
       return res;
     }
 
     if (msg.action === "STOP_RECORDING") {
-      const res = await callOffscreen({ action: "STOP_RECORDING" });
+      const res = await callOffscreen({
+        action: "STOP_RECORDING",
+        speaker_events: msg.speaker_events,
+        participants: msg.participants,
+        self_name: msg.self_name,
+        recording_started_at_ms: msg.recording_started_at_ms,
+        meetTabId: msg.meetTabId,
+      });
       return res;
     }
 

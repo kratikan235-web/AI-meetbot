@@ -6,6 +6,7 @@ const MIN_BYTES_PER_SECOND = 800;
 const statusEl = document.getElementById("status");
 let recordingStartedAt = 0;
 let recordMode = "none";
+let meetTabId = null;
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
@@ -79,6 +80,43 @@ function callOffscreen(message) {
   });
 }
 
+function callContentScript(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { target: "content", ...message }, (resp) => {
+      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+      else resolve(resp || { ok: false, error: "No response from content script" });
+    });
+  });
+}
+
+/** Popup has reliable tab access — fetch speaker data here at Stop. */
+async function fetchSpeakerDataFromMeetTab(tabId) {
+  if (!tabId) return null;
+
+  let ping = await callContentScript(tabId, { action: "PING" });
+  if (!ping?.ok) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      await new Promise((r) => setTimeout(r, 100));
+      ping = await callContentScript(tabId, { action: "PING" });
+    } catch {
+      console.warn("[popup] could not inject content.js");
+    }
+  }
+  if (!ping?.ok) return null;
+
+  const data = await callContentScript(tabId, { action: "GET_SPEAKER_DATA" });
+  await callContentScript(tabId, { action: "CLEAR_SPEAKER_DATA" });
+
+  if (!data?.ok) return null;
+
+  console.log("[popup] participants collected:", JSON.stringify(data.participants || []));
+  console.log("[popup] speaker_events collected:", JSON.stringify(data.speaker_events || []));
+  console.log("[popup] self_name:", data.self_name || "(none)");
+
+  return data;
+}
+
 async function refreshStatus() {
   try {
     await ensureOffscreenDocument();
@@ -140,11 +178,13 @@ document.getElementById("start").addEventListener("click", () => {
         });
       });
 
+      meetTabId = tab.id;
+
       await ensureOffscreenDocument();
       // Prefer direct offscreen messaging (avoids SW wake/race issues).
-      let res = await callOffscreen({ action: "START_RECORDING", streamId });
+      let res = await callOffscreen({ action: "START_RECORDING", streamId, meetTabId: tab.id });
       if (!res?.ok) {
-        res = await callBackground({ action: "START_RECORDING", streamId });
+        res = await callBackground({ action: "START_RECORDING", streamId, meetTabId: tab.id });
       }
       if (!res?.ok) {
         setStatus(res?.error || "Failed to start recording.", true);
@@ -170,8 +210,35 @@ document.getElementById("stop").addEventListener("click", () => {
   setStatus("Uploading…");
 
   ensureOffscreenDocument()
-    .then(() => callOffscreen({ action: "STOP_RECORDING" }))
-    .then((res) => (res?.ok ? res : callBackground({ action: "STOP_RECORDING" })))
+    .then(async () => {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs[0];
+      const tabId = meetTabId || tab?.id || null;
+
+      let speakerPayload = {
+        recording_started_at_ms: recordingStartedAt,
+        meetTabId: tabId,
+      };
+
+      if (tabId && tab?.url?.includes("meet.google.com")) {
+        const speakerData = await fetchSpeakerDataFromMeetTab(tabId);
+        if (speakerData) {
+          speakerPayload = {
+            speaker_events: speakerData.speaker_events || [],
+            participants: speakerData.participants || [],
+            self_name: speakerData.self_name || null,
+            recording_started_at_ms: recordingStartedAt,
+            meetTabId: tabId,
+          };
+        }
+      }
+
+      let res = await callOffscreen({ action: "STOP_RECORDING", ...speakerPayload });
+      if (!res?.ok) {
+        res = await callBackground({ action: "STOP_RECORDING", ...speakerPayload });
+      }
+      return res;
+    })
     .then((res) => {
       if (!res?.ok) {
         setStatus(res?.error || "Failed to stop recording.", true);
