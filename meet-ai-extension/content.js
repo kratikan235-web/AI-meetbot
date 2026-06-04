@@ -313,19 +313,27 @@ function refreshRosterParticipants(forceLog) {
 function findActiveSpeakerName() {
   if (isSoloMeeting()) return selfName;
 
+  const speaking = [];
   for (const tile of document.querySelectorAll("[data-participant-id]")) {
-    const speaking =
+    const speakingFlag =
       tile.getAttribute("data-is-speaking") === "true" ||
       tile.querySelector("[data-is-speaking='true']") ||
       tile.matches?.("[data-is-speaking='true']");
-    if (!speaking) continue;
+    if (!speakingFlag) continue;
 
     const name = extractNameFromParticipantTile(tile);
-    if (name && isHumanParticipantName(name)) {
-      if (rosterNameSet().size === 0 || rosterHasName(name)) return name;
-    }
+    if (!name || !isHumanParticipantName(name)) continue;
+    if (rosterNameSet().size > 0 && !rosterHasName(name)) continue;
+
+    const aria = normalizeText(tile.getAttribute("aria-label") || "");
+    const isYou = /\b\(you\)\b/i.test(aria) || (selfName && name === selfName);
+    speaking.push({ name, isYou });
   }
-  return null;
+
+  if (!speaking.length) return null;
+  const you = speaking.find((s) => s.isYou);
+  if (you) return you.name;
+  return speaking[0].name;
 }
 
 function pushSpeakerEvent(name, source, tOverride) {
@@ -410,11 +418,41 @@ function scrubCollectedEvents() {
   );
 }
 
+function reconcileRecorderMonologue() {
+  if (!selfName) return;
+  const names = new Set(collectedSpeakerEvents.map((e) => e.name));
+  if (names.size !== 1 || names.has(selfName)) return;
+
+  let otherCaptionSpeakers = 0;
+  for (const root of findMeetCaptionRoots()) {
+    for (const line of parseCaptionLinesFromRoot(root)) {
+      if (!isSpeakerOnlyLine(line)) continue;
+      const sp = resolveCaptionSpeaker(line);
+      if (sp && sp !== selfName) otherCaptionSpeakers++;
+    }
+  }
+  if (otherCaptionSpeakers > 0) return;
+
+  collectedSpeakerEvents = [{ t: 0, name: selfName, source: "recorder_monologue_fix" }];
+}
+
+function rescaleTranscriptBlockEvents() {
+  const blocks = collectedSpeakerEvents.filter((e) => e.source === "transcript_block");
+  if (!blocks.length) return;
+  const duration = Math.max(relMs(), 1000);
+  const n = blocks.length;
+  for (let i = 0; i < n; i++) {
+    blocks[i].t = n === 1 ? 0 : Math.floor((i / n) * duration);
+  }
+}
+
 function finalizeSpeakerData() {
   if (!selfName) selfName = findSelfNameFromAccount();
 
   pollCaptionsForSpeakers(true);
   parseMeetTranscriptSpeakerBlocks(true);
+  rescaleTranscriptBlockEvents();
+  reconcileRecorderMonologue();
   scrubCollectedEvents();
 
   refreshRosterParticipants(true);
@@ -449,8 +487,13 @@ function finalizeSpeakerData() {
     return true;
   });
 
+  const hasCaptionSpeakers = collectedSpeakerEvents.some((e) =>
+    ["transcript_block", "caption", "captions_final"].includes(e.source),
+  );
   const active = findActiveSpeakerName();
-  if (active) pushSpeakerEvent(active, "active_speaker_final");
+  if (active && !hasCaptionSpeakers) {
+    pushSpeakerEvent(active, "active_speaker_final");
+  }
 
   if (!collectedSpeakerEvents.length && selfName) {
     pushSpeakerEvent(selfName, "self_fallback");
@@ -579,7 +622,7 @@ function parseMeetTranscriptSpeakerBlocks(finalPass) {
       const speaker = resolveCaptionSpeaker(line);
       if (!speaker) continue;
 
-      const t = finalPass ? blockIdx * 10000 : relMs();
+      const t = finalPass ? blockIdx * 3000 : relMs();
       addRosterParticipant(speaker, "transcript_block");
       pushSpeakerEvent(speaker, "transcript_block", t);
       blockIdx++;

@@ -1,4 +1,3 @@
-const BACKEND_URL = "http://127.0.0.1:8000/upload";
 const MIN_RECORD_MS = 3000;
 const MIN_BLOB_BYTES = 8000;
 const MIN_BYTES_PER_SECOND = 800;
