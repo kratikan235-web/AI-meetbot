@@ -30,7 +30,7 @@ _UI_SUFFIX_RE = re.compile(
     re.I,
 )
 
-# Meet DOM sometimes glues labels: "Keshavi DubeyKeshavi Dubeydevices"
+# Meet DOM sometimes glues labels: "Jane SmithJane Smithdevices"
 _LEADING_NAME_RE = re.compile(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
 
 

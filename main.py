@@ -200,11 +200,31 @@ def _timeline_is_degenerate(events: list[dict], duration_sec: float) -> bool:
 def _host_from_roster(roster: list[str], host_name: str | None) -> str | None:
     if host_name and is_valid_person_name(host_name) and host_name in roster:
         return host_name
-    return next((n for n in roster if "kratika" in n.lower()), None)
+    return None
 
 
-def _roster_match(roster: list[str], substring: str) -> str | None:
-    return next((n for n in roster if substring in n.lower()), None)
+def _first_non_host(roster: list[str], host: str | None) -> str | None:
+    if host:
+        others = [n for n in roster if n != host]
+        return others[0] if others else None
+    return roster[0] if roster else None
+
+
+def _roster_names_mentioned_in_text(
+    text_lower: str, roster: list[str], *, skip: set[str] | None = None
+) -> list[str]:
+    """Roster members whose first name appears as a word in the transcript."""
+    skip = skip or set()
+    mentioned: list[str] = []
+    for name in roster:
+        if name in skip or not is_valid_person_name(name):
+            continue
+        first = name.split()[0].lower()
+        if len(first) < 3:
+            continue
+        if re.search(rf"\b{re.escape(first)}\b", text_lower):
+            mentioned.append(name)
+    return mentioned
 
 
 def _content_speaker_for_segment(
@@ -219,8 +239,6 @@ def _content_speaker_for_segment(
     """
     lower = text.lower()
     host = _host_from_roster(roster, host_name)
-    kratika = _roster_match(roster, "kratika")
-    aman = _roster_match(roster, "aman")
 
     addressed, addr_reason = _addressed_other_speaker(text, roster)
     if addressed:
@@ -232,19 +250,24 @@ def _content_speaker_for_segment(
     if host and re.search(r"now you can continue|you can continue|yes,?\s*sure", lower):
         return host, "host yielding or confirming turn"
 
-    if re.search(r"could i start", lower) and aman:
-        return aman, "participant asking permission to start"
+    if re.search(r"could i start", lower):
+        asker = _first_non_host(roster, host)
+        if asker:
+            return asker, "participant asking permission to start"
 
-    if host and re.search(
-        r"(?:krthika|kratika).{0,60}(?:hosting|initiating)", lower
-    ):
-        others = [n for n in roster if n != host]
-        if len(others) == 1:
-            return others[0], "describing host (speaker is not the host)"
-        if len(others) >= 2:
-            keshavi = _roster_match(others, "keshavi")
-            if keshavi:
-                return keshavi, "side comment about host"
+    if host:
+        host_first = host.split()[0].lower()
+        if len(host_first) >= 3 and re.search(
+            rf"\b{re.escape(host_first)}\b.{0,60}(?:hosting|initiating)", lower
+        ):
+            others = [n for n in roster if n != host]
+            if len(others) == 1:
+                return others[0], "describing host (speaker is not the host)"
+            if len(others) >= 2:
+                commenters = _roster_names_mentioned_in_text(lower, others, skip={host})
+                if commenters:
+                    return commenters[0], "side comment about host"
+                return others[0], "side comment about host"
 
     is_thanks = bool(
         re.search(r"thank\s+you|thanks\s+for\s+your\s+update", lower)
@@ -267,26 +290,25 @@ def _content_speaker_for_segment(
     )
 
     if is_thanks and not is_update:
-        return host or kratika or roster[-1], "thank-you / acknowledgment"
+        return host or (roster[-1] if roster else None), "thank-you / acknowledgment"
     if is_farewell and not is_thanks and not is_update and prev_speaker and len(roster) >= 2:
         other = next((n for n in roster if n != prev_speaker), None)
         if other:
             return other, f"farewell after {prev_speaker.split()[0]} spoke"
     if is_question and not is_update and not re.search(r"could i start", lower):
-        return host or kratika or roster[0], "facilitator question to group"
+        return host or (roster[0] if roster else None), "facilitator question to group"
     if is_update and not is_question:
-        return aman or roster[0], "work-update phrasing (long answer)"
+        updater = _first_non_host(roster, host) or (roster[0] if roster else None)
+        if updater:
+            return updater, "work-update phrasing (long answer)"
 
-    if re.search(r"\bkartiga\b|\bkratika\b", lower) and kratika and not re.search(
-        r"hosting|initiating", lower
-    ):
-        return kratika, "kartiga/kratika in text"
-    if re.search(r"\baman\b", lower) and aman and not is_update:
-        return aman, "aman in text"
-    if re.search(r"\bkeshavi\b|\bkishie\b", lower):
-        keshavi = _roster_match(roster, "keshavi")
-        if keshavi:
-            return keshavi, "keshavi/kishie mentioned in text"
+    mentioned = _roster_names_mentioned_in_text(lower, roster)
+    if mentioned and not is_update:
+        skip_host_desc = {host} if host else set()
+        for name in mentioned:
+            if name in skip_host_desc and re.search(r"hosting|initiating", lower):
+                continue
+            return name, f"{name.split()[0]} mentioned in text"
 
     return None, None
 

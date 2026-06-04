@@ -1,5 +1,5 @@
 // Meet speaker tracking v3.0 — real participant names only.
-// Solo meeting: only your Google account name (e.g. Kratika Namdev).
+// Solo meeting: only your Google account name (e.g. Jane Smith).
 
 const POLL_MS = 400;
 const ROSTER_REFRESH_MS = 3000;
