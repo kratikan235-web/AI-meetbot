@@ -4,7 +4,7 @@ import os
 import json
 import re
 
-from stt.whisper_service import transcribe_audio, transcribe_segments
+from stt.whisper_service import transcribe_audio, transcribe_segments, unload_model
 from llm.ollama_service import generate_mom, generate_speaker_aware_mom
 from utils.file_writer import save_mom_file
 from utils.recording_paths import dated_recording_path
@@ -538,8 +538,16 @@ async def upload_audio(
             if str(s.get("text", "")).strip()
         ).strip()
 
+    # Free Whisper RAM so Ollama can load on low-memory machines (same upload request).
+    unload_model()
+
     if speaker_segments:
-        summary = generate_speaker_aware_mom(speaker_segments, participants_list)
+        summary = generate_speaker_aware_mom(
+            speaker_segments,
+            participants_list,
+            transcript=transcript,
+            speaker_transcript=speaker_transcript,
+        )
     else:
         summary = generate_mom(transcript)
 
