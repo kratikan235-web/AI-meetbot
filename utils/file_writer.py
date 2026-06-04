@@ -5,7 +5,7 @@ from utils.recording_paths import dated_session_dir
 
 
 def save_mom_file(content: str) -> str:
-    """mom_reports/<03 june>/mom_YYYY-MM-DD_HH-MM-SS.md"""
+    """mom_reports/<2026-06-04>/mom_YYYY-MM-DD_HH-MM-SS.md"""
     now = datetime.now()
     day_folder = dated_session_dir("mom_reports", now)
     filename = now.strftime("mom_%Y-%m-%d_%H-%M-%S.md")

@@ -2,18 +2,26 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import shutil
 import os
 import json
-import re
 
-from stt.whisper_service import transcribe_audio, transcribe_segments
-from llm.ollama_service import generate_mom, generate_speaker_aware_mom
+from stt.whisper_service import transcribe_audio, transcribe_segments, unload_model
+from llm.mom_service import generate_mom, generate_speaker_aware_mom
 from utils.file_writer import save_mom_file
 from utils.recording_paths import dated_recording_path
+from utils.speaker_content import (
+    content_speaker_for_segment,
+    guess_speaker_from_transcript,
+    addressed_other_speaker,
+)
 from utils.speaker_names import (
     build_speaker_timeline,
     canonicalize_speaker_name,
+    events_for_segment_mapping,
     filter_person_names,
     is_valid_person_name,
+    other_speaker_proven_in_captions,
     sanitize_speaker_events,
+    transcript_is_recorder_monologue,
+    _CAPTION_SOURCES,
 )
 from utils.audio_convert import (
     to_whisper_wav,
@@ -102,44 +110,37 @@ def _normalize_speaker_events(
     return out
 
 
-def _guess_speaker_from_transcript(transcript: str) -> str | None:
-    m = re.search(
-        r"\b(?:i'?m|i am|my name is|this is)\s+([A-Za-z][\w .'-]{1,40})\b",
-        transcript,
-        re.I,
-    )
-    if m:
-        name = m.group(1).strip()
-        if is_valid_person_name(name):
-            return name
-    return None
-
-
 _TRANSITION_WINDOW_MS = 3000
 
 
-def _addressed_other_speaker(
-    text: str, roster: list[str]
-) -> tuple[str | None, str | None]:
-    """Speaker talking TO someone named in the text (not the named person)."""
-    lower = text.lower()
-    for name in roster:
-        if not is_valid_person_name(name):
+def _speaker_for_segment_time(
+    events: list[dict],
+    t_ms: int,
+    recorder: str,
+    roster: list[str],
+) -> str:
+    """
+    Default to recorder (mic). Assign someone else only if captions prove they spoke near t_ms.
+    """
+    roster_set = set(roster)
+    window_start = max(0, t_ms - 2000)
+    window_end = t_ms + 2000
+    in_window = [e for e in events if window_start <= int(e.get("t", 0)) <= window_end]
+
+    for e in in_window:
+        if e.get("source") not in _CAPTION_SOURCES:
             continue
-        first = name.split()[0].lower()
-        if len(first) < 3:
-            continue
-        others = [n for n in roster if n != name]
-        if len(others) != 1:
-            continue
-        if re.search(rf"\b(?:hello|hi|hey)\s+{re.escape(first)}\b", lower):
-            return others[0], f"greeting directed at {first} (speaker is the other participant)"
-        if re.search(rf"\b{re.escape(first)}\b", lower) and re.search(
-            r"\b(?:share your|give your|your update|updates again)\b",
-            lower,
-        ):
-            return others[0], f"asking {first} for an update (speaker is the other participant)"
-    return None, None
+        name = e.get("name", "")
+        if name in roster_set and name != recorder:
+            return name
+
+    if recorder and recorder in roster_set:
+        return recorder
+    if in_window:
+        return in_window[-1].get("name", "Unknown")
+    if events:
+        return _nearest_event_before(events, t_ms)["name"]
+    return roster[0] if roster else "Unknown"
 
 
 def _nearest_event_before(events: list[dict], t_ms: int) -> dict:
@@ -161,26 +162,21 @@ def _pick_speaker_from_timeline(
     is_first: bool,
     is_last: bool,
 ) -> tuple[str, str]:
-    """Nearest speaker events at start/mid/end; wider window on first/last segments."""
-    votes: dict[str, int] = {}
-    details: list[str] = []
+    """Pick speaker at segment start (primary), with light mid/end checks."""
+    before_start = _nearest_event_before(events, s0_ms)
+    votes: dict[str, int] = {before_start["name"]: 4}
+    details = [f"start ({s0_ms / 1000:.1f}s): {before_start['name']}"]
 
-    for t_ms, label in ((s0_ms, "start"), (mid_ms, "mid"), (max(s1_ms - 1, s0_ms), "end")):
-        before = _nearest_event_before(events, t_ms)
-        votes[before["name"]] = votes.get(before["name"], 0) + 2
-        details.append(
-            f"before {label} ({t_ms / 1000:.1f}s): {before['name']} at {before['t'] / 1000:.1f}s"
-        )
-        if is_first or is_last:
-            after = _nearest_event_after(events, t_ms)
-            if abs(int(after["t"]) - t_ms) <= _TRANSITION_WINDOW_MS:
-                votes[after["name"]] = votes.get(after["name"], 0) + 1
-                details.append(
-                    f"after {label} ({t_ms / 1000:.1f}s): {after['name']} at {after['t'] / 1000:.1f}s"
-                )
+    before_mid = _nearest_event_before(events, mid_ms)
+    votes[before_mid["name"]] = votes.get(before_mid["name"], 0) + 1
+
+    if is_first or is_last:
+        after_start = _nearest_event_after(events, s0_ms)
+        if abs(int(after_start["t"]) - s0_ms) <= _TRANSITION_WINDOW_MS:
+            votes[after_start["name"]] = votes.get(after_start["name"], 0) + 1
 
     winner = max(votes, key=lambda k: votes[k])
-    return winner, f"timeline vote ({votes[winner]} pts): " + "; ".join(details[:4])
+    return winner, f"timeline: {winner} (" + "; ".join(details[:2]) + ")"
 
 
 def _timeline_is_degenerate(events: list[dict], duration_sec: float) -> bool:
@@ -197,122 +193,6 @@ def _timeline_is_degenerate(events: list[dict], duration_sec: float) -> bool:
     return span < duration_ms * 0.12
 
 
-def _host_from_roster(roster: list[str], host_name: str | None) -> str | None:
-    if host_name and is_valid_person_name(host_name) and host_name in roster:
-        return host_name
-    return None
-
-
-def _first_non_host(roster: list[str], host: str | None) -> str | None:
-    if host:
-        others = [n for n in roster if n != host]
-        return others[0] if others else None
-    return roster[0] if roster else None
-
-
-def _roster_names_mentioned_in_text(
-    text_lower: str, roster: list[str], *, skip: set[str] | None = None
-) -> list[str]:
-    """Roster members whose first name appears as a word in the transcript."""
-    skip = skip or set()
-    mentioned: list[str] = []
-    for name in roster:
-        if name in skip or not is_valid_person_name(name):
-            continue
-        first = name.split()[0].lower()
-        if len(first) < 3:
-            continue
-        if re.search(rf"\b{re.escape(first)}\b", text_lower):
-            mentioned.append(name)
-    return mentioned
-
-
-def _content_speaker_for_segment(
-    text: str,
-    roster: list[str],
-    prev_speaker: str | None = None,
-    host_name: str | None = None,
-) -> tuple[str | None, str | None]:
-    """
-    Infer speaker from what was said (question vs work update vs thanks).
-    Used when Meet timeline timestamps are not aligned with audio.
-    """
-    lower = text.lower()
-    host = _host_from_roster(roster, host_name)
-
-    addressed, addr_reason = _addressed_other_speaker(text, roster)
-    if addressed:
-        return addressed, addr_reason
-
-    if host and re.search(r"hello everyone|we can start now|can start now", lower):
-        return host, "host opening the meeting"
-
-    if host and re.search(r"now you can continue|you can continue|yes,?\s*sure", lower):
-        return host, "host yielding or confirming turn"
-
-    if re.search(r"could i start", lower):
-        asker = _first_non_host(roster, host)
-        if asker:
-            return asker, "participant asking permission to start"
-
-    if host:
-        host_first = host.split()[0].lower()
-        if len(host_first) >= 3 and re.search(
-            rf"\b{re.escape(host_first)}\b.{0,60}(?:hosting|initiating)", lower
-        ):
-            others = [n for n in roster if n != host]
-            if len(others) == 1:
-                return others[0], "describing host (speaker is not the host)"
-            if len(others) >= 2:
-                commenters = _roster_names_mentioned_in_text(lower, others, skip={host})
-                if commenters:
-                    return commenters[0], "side comment about host"
-                return others[0], "side comment about host"
-
-    is_thanks = bool(
-        re.search(r"thank\s+you|thanks\s+for\s+your\s+update", lower)
-    )
-    is_farewell = bool(re.search(r"have a nice day|nice day", lower))
-    is_question = bool(
-        re.search(
-            r"what are you doing|give your update|can you please|how about you|"
-            r"keep you happy|horrible\.?\s*hi|share your update",
-            lower,
-        )
-    )
-    is_update = bool(
-        re.search(
-            r"\b(class|junior|deployment|module|config|test|campaign|solar|"
-            r"implementation|frontline|morning|took a|multi-tenant|configuration|"
-            r"portfolio|vecta|django)\b",
-            lower,
-        )
-    )
-
-    if is_thanks and not is_update:
-        return host or (roster[-1] if roster else None), "thank-you / acknowledgment"
-    if is_farewell and not is_thanks and not is_update and prev_speaker and len(roster) >= 2:
-        other = next((n for n in roster if n != prev_speaker), None)
-        if other:
-            return other, f"farewell after {prev_speaker.split()[0]} spoke"
-    if is_question and not is_update and not re.search(r"could i start", lower):
-        return host or (roster[0] if roster else None), "facilitator question to group"
-    if is_update and not is_question:
-        updater = _first_non_host(roster, host) or (roster[0] if roster else None)
-        if updater:
-            return updater, "work-update phrasing (long answer)"
-
-    mentioned = _roster_names_mentioned_in_text(lower, roster)
-    if mentioned and not is_update:
-        skip_host_desc = {host} if host else set()
-        for name in mentioned:
-            if name in skip_host_desc and re.search(r"hosting|initiating", lower):
-                continue
-            return name, f"{name.split()[0]} mentioned in text"
-
-    return None, None
-
-
 def _assign_speakers_to_segments(
     segments: list[dict],
     speaker_events: list[dict],
@@ -321,6 +201,7 @@ def _assign_speakers_to_segments(
     *,
     force_content: bool = False,
     host_name: str | None = None,
+    recorder_name: str | None = None,
 ) -> list[dict]:
     """
     Map whisper segments -> speaker names using speaker_events timeline.
@@ -339,16 +220,36 @@ def _assign_speakers_to_segments(
             continue
         if roster and name not in roster:
             continue
-        events.append({"t": int(e.get("t", 0)), "name": name})
-    events.sort(key=lambda e: e["t"])
+        events.append({"t": int(e.get("t", 0)), "name": name, "source": str(e.get("source", ""))})
+    all_events = list(events)
+    events = events_for_segment_mapping(events)
     use_content = force_content or _timeline_is_degenerate(events, duration_sec)
+    recorder = (recorder_name or host_name or "").strip()
+    full_text = " ".join(str(s.get("text", "")).strip() for s in segments)
+
+    if (
+        recorder
+        and recorder in roster
+        and transcript_is_recorder_monologue(full_text)
+        and not other_speaker_proven_in_captions(
+            [e for e in all_events if e.get("source") in _CAPTION_SOURCES],
+            recorder,
+            set(roster),
+        )
+    ):
+        return [{"speaker": recorder, **s} for s in segments]
+
+    if recorder and recorder in roster and len(roster) >= 2:
+        use_recorder_default = True
+    else:
+        use_recorder_default = False
 
     if use_content and roster:
         labeled = []
         prev_speaker = None
         for s in segments:
             txt = str(s.get("text", "")).strip()
-            sp, _ = _content_speaker_for_segment(
+            sp, _ = content_speaker_for_segment(
                 txt, roster, prev_speaker=prev_speaker, host_name=host_name
             )
             if not sp:
@@ -362,9 +263,10 @@ def _assign_speakers_to_segments(
         return [{"speaker": "Unknown", **s} for s in segments]
 
     labeled: list[dict] = []
-    alt_idx = 0
     prev_speaker = None
     n_seg = len(segments)
+    use_content_override = force_content
+
     for idx, s in enumerate(segments):
         s0 = int(float(s["start"]) * 1000)
         s1 = int(float(s["end"]) * 1000)
@@ -373,28 +275,38 @@ def _assign_speakers_to_segments(
         mid = (s0 + s1) // 2
         txt = str(s.get("text", "")).strip()
 
-        best_name = "Unknown"
-        addressed, _ = _addressed_other_speaker(txt, roster)
-        if addressed:
-            best_name = addressed
+        if use_recorder_default:
+            best_name = _speaker_for_segment_time(all_events, s0, recorder, roster)
         else:
-            best_name, _ = _pick_speaker_from_timeline(
-                events,
-                s0,
-                s1,
-                mid,
-                is_first=(idx == 0),
-                is_last=(idx == n_seg - 1),
-            )
-            content_sp, _ = _content_speaker_for_segment(
-                txt, roster, prev_speaker=prev_speaker, host_name=host_name
-            )
-            if content_sp:
-                best_name = content_sp
+            best_name = "Unknown"
+            addressed, _ = addressed_other_speaker(txt, roster)
+            if addressed:
+                best_name = addressed
+            else:
+                best_name, _ = _pick_speaker_from_timeline(
+                    events,
+                    s0,
+                    s1,
+                    mid,
+                    is_first=(idx == 0),
+                    is_last=(idx == n_seg - 1),
+                )
+                if use_content_override or best_name == "Unknown":
+                    content_sp, _ = content_speaker_for_segment(
+                        txt, roster, prev_speaker=prev_speaker, host_name=host_name
+                    )
+                    if content_sp:
+                        best_name = content_sp
 
-        if best_name == "Unknown" and len(roster) >= 2:
-            best_name = roster[alt_idx % len(roster)]
-            alt_idx += 1
+            if best_name == "Unknown":
+                if recorder and recorder in roster:
+                    best_name = recorder
+                elif prev_speaker:
+                    best_name = prev_speaker
+                elif events:
+                    best_name = _nearest_event_before(events, s0)["name"]
+                elif roster:
+                    best_name = roster[0]
 
         labeled.append({"speaker": best_name, **s})
         prev_speaker = best_name
@@ -455,7 +367,23 @@ async def upload_audio(
             participants_list = [trusted_self] + participants_list
 
     normalized_raw = _normalize_speaker_events(raw_events_list, recording_started_at_ms)
-    events_list = build_speaker_timeline(normalized_raw, participants_list, duration)
+    events_list = build_speaker_timeline(
+        normalized_raw, participants_list, duration, recorder_name=trusted_self
+    )
+    if (
+        trusted_self
+        and is_valid_person_name(trusted_self)
+        and transcript_is_recorder_monologue(transcript)
+        and len({e.get("name") for e in events_list}) == 1
+        and trusted_self not in {e.get("name") for e in events_list}
+        and not other_speaker_proven_in_captions(
+            [e for e in normalized_raw if isinstance(e, dict) and e.get("source") in _CAPTION_SOURCES],
+            trusted_self,
+            set(participants_list),
+        )
+    ):
+        events_list = [{"t": 0, "name": trusted_self, "source": "recorder_monologue"}]
+        print(f"Speaker timeline: recorder monologue -> {trusted_self}")
 
     def _distinct_valid_speakers(events: list[dict]) -> set[str]:
         names: set[str] = set()
@@ -480,7 +408,7 @@ async def upload_audio(
                 events_list = [{"t": 0, "name": trusted_self, "source": "self_name_fix"}]
 
     if not events_list:
-        guessed = _guess_speaker_from_transcript(transcript)
+        guessed = guess_speaker_from_transcript(transcript)
         if guessed and is_valid_person_name(guessed):
             events_list = [{"t": 0, "name": guessed, "source": "transcript_guess"}]
 
@@ -526,6 +454,7 @@ async def upload_audio(
             duration_sec=duration,
             force_content=degenerate,
             host_name=host_for_mapping,
+            recorder_name=trusted_self,
         )
         for seg in speaker_segments:
             sp = str(seg.get("speaker", ""))
@@ -538,8 +467,16 @@ async def upload_audio(
             if str(s.get("text", "")).strip()
         ).strip()
 
+    # Free Whisper RAM so Ollama can load on low-memory machines (same upload request).
+    unload_model()
+
     if speaker_segments:
-        summary = generate_speaker_aware_mom(speaker_segments, participants_list)
+        summary = generate_speaker_aware_mom(
+            speaker_segments,
+            participants_list,
+            transcript=transcript,
+            speaker_transcript=speaker_transcript,
+        )
     else:
         summary = generate_mom(transcript)
 
@@ -553,7 +490,6 @@ async def upload_audio(
 
 ---
 
-## Summary
 {summary}
 """
     saved_file = save_mom_file(final_doc)

@@ -3,20 +3,20 @@ from datetime import datetime
 
 
 def date_folder_name(when: datetime | None = None) -> str:
-    """Per-day folder label, e.g. '03 june'."""
+    """Per-day folder label, e.g. '2026-06-04'."""
     when = when or datetime.now()
-    return when.strftime("%d %B").lower()
+    return when.strftime("%Y-%m-%d")
 
 
 def dated_session_dir(base_dir: str, when: datetime | None = None) -> str:
-    """Create and return base_dir/<day month>/ (e.g. mom_reports/03 june/)."""
+    """Create and return base_dir/<YYYY-MM-DD>/ (e.g. mom_reports/2026-06-04/)."""
     folder = os.path.join(base_dir, date_folder_name(when))
     os.makedirs(folder, exist_ok=True)
     return folder
 
 
 def dated_recording_path(original_filename: str) -> str:
-    """recordings/<03 june>/meeting_HH-MM-SS.ext"""
+    """recordings/<2026-06-04>/meeting_HH-MM-SS.ext"""
     now = datetime.now()
     time_stamp = now.strftime("%H-%M-%S")
     ext = os.path.splitext(original_filename or "meeting.webm")[1] or ".webm"
